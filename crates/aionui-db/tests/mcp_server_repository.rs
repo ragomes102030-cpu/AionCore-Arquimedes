@@ -170,6 +170,76 @@ async fn list_returns_all_ordered_by_created_at() {
     assert_eq!(all[2].id, s3.id);
 }
 
+// -- R-5: malformed timestamps are excluded from a read, not fatal --
+//
+// These two reach past the trait on purpose: the trait cannot produce a row with
+// a TEXT timestamp, so the state has to be injected in SQL to be reproducible.
+// Same approach as the other migration tests in this crate.
+
+#[tokio::test]
+async fn list_skips_rows_whose_timestamps_are_not_integers() {
+    let (r, db) = repo().await;
+    let healthy = r.create(stdio_params()).await.unwrap();
+
+    // See the `list` doc in `sqlite_mcp_server.rs` for why a TEXT date can sit
+    // in an INTEGER column and what it used to break.
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+           (id, user_id, name, description, enabled, transport_type, transport_config, \
+            tools, last_test_status, last_connected, original_json, builtin, \
+            deleted_at, created_at, updated_at) \
+         VALUES ('mcp_malformed', ?, 'malformed-mcp', NULL, 0, 'stdio', \
+            '{\"command\":\"npx\"}', NULL, 'disconnected', NULL, NULL, 0, NULL, \
+            '2026-03-01 10:48:38', '2026-03-01 10:48:38')",
+    )
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let all = r
+        .list(USER_ID)
+        .await
+        .expect("a malformed timestamp must not fail the whole list");
+
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].id, healthy.id);
+
+    let still_stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mcp_servers WHERE id = 'mcp_malformed'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        still_stored, 1,
+        "the malformed row must stay in the table for migration 045 to repair"
+    );
+}
+
+#[tokio::test]
+async fn list_returns_empty_when_every_row_is_malformed() {
+    let (r, db) = repo().await;
+
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+           (id, user_id, name, description, enabled, transport_type, transport_config, \
+            tools, last_test_status, last_connected, original_json, builtin, \
+            deleted_at, created_at, updated_at) \
+         VALUES ('mcp_iso', ?, 'iso-mcp', NULL, 0, 'stdio', '{\"command\":\"npx\"}', \
+            NULL, 'disconnected', NULL, NULL, 0, NULL, \
+            '2026-03-01T10:48:38Z', '2026-03-01T10:48:38Z')",
+    )
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let all = r
+        .list(USER_ID)
+        .await
+        .expect("a fully malformed catalog degrades to empty, not to an error");
+    assert!(all.is_empty());
+}
+
 // -- U-1/U-2/U-3: Update fields --
 
 #[tokio::test]
