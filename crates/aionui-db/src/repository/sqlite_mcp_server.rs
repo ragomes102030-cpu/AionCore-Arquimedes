@@ -4,6 +4,8 @@ use aionui_common::TimestampMs;
 use sqlx::QueryBuilder;
 use sqlx::SqlitePool;
 
+use tracing::warn;
+
 use crate::error::DbError;
 use crate::models::McpServerRow;
 use crate::repository::mcp_server::{CreateMcpServerParams, IMcpServerRepository, UpdateMcpServerParams};
@@ -18,17 +20,62 @@ impl SqliteMcpServerRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// Report how many rows [`Self::list`] had to hide.
+    ///
+    /// Observability only. By the time this runs the malformed rows are already
+    /// excluded, so a failure here must never turn a served catalog into a 500 —
+    /// the tradeoff is a `warn!` that under-reports instead of a hard failure.
+    async fn warn_on_malformed_timestamps(&self, user_id: &str) {
+        let counted = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mcp_servers \
+             WHERE user_id = ? AND deleted_at IS NULL \
+               AND (typeof(created_at) != 'integer' OR typeof(updated_at) != 'integer')",
+        )
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await;
+
+        match counted {
+            Ok(malformed) if malformed > 0 => warn!(
+                user_id = %user_id,
+                malformed_rows = malformed,
+                "mcp_servers rows hidden from list(): created_at/updated_at are not INTEGER; \
+                 they stay in the database awaiting migration 045_fix_mcp_server_timestamps"
+            ),
+            Ok(_) => {}
+            Err(error) => warn!(
+                user_id = %user_id,
+                error = %error,
+                "could not count malformed mcp_servers rows; the list() guard still applied"
+            ),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl IMcpServerRepository for SqliteMcpServerRepository {
+    /// `created_at` / `updated_at` are declared INTEGER, but SQLite type affinity
+    /// is a conversion hint rather than a constraint, so a TEXT date written by
+    /// an older tool, an import, or a hand-edit is stored as-is. `TimestampMs` is
+    /// an `i64` alias, so sqlx decodes strictly: ONE such row fails the decode for
+    /// the whole result set and surfaces as HTTP 500 on `GET /api/mcp/servers`,
+    /// taking down the MCP settings page and the agent tool catalog rather than a
+    /// single entry. There is no partial result set to degrade to, so the rows are
+    /// excluded from the decode instead. They stay in the table for migration
+    /// `045_fix_mcp_server_timestamps` to repair.
     async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
         let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT * FROM mcp_servers WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at ASC, rowid ASC",
+            "SELECT * FROM mcp_servers \
+             WHERE user_id = ? AND deleted_at IS NULL \
+               AND typeof(created_at) = 'integer' AND typeof(updated_at) = 'integer' \
+             ORDER BY created_at ASC, rowid ASC",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
+
+        self.warn_on_malformed_timestamps(user_id).await;
 
         Ok(rows)
     }
